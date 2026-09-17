@@ -1,43 +1,163 @@
 import io
-import os
 import uuid
-from typing import Dict, List
+import traceback
+from typing import List
 
 import faiss
 import numpy as np
-from dotenv import load_dotenv
+import ollama
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from openai import OpenAI
+from pydantic import BaseModel
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
-from pydantic import BaseModel
 
-load_dotenv()
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY is missing. Add it to backend/.env")
-
-client = OpenAI(api_key=OPENAI_API_KEY)
-embedding_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-
-app = FastAPI(title="AI Document Chat API", version="1.0.0")
+app = FastAPI(title="DocuMind AI API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+        "http://localhost:5175",
+        "http://127.0.0.1:5175",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-sessions: Dict[str, dict] = {}
-
-CHUNK_SIZE = 900
-CHUNK_OVERLAP = 140
-TOP_K = 5
+MODEL = "qwen2.5:3b"
+OLLAMA_HOST = "http://127.0.0.1:11434"
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 MAX_FILE_SIZE = 20 * 1024 * 1024
+CHUNK_SIZE = 700
+CHUNK_OVERLAP = 100
+TOP_K = 4
+
+ollama_client = ollama.Client(host=OLLAMA_HOST)
+embedder = SentenceTransformer(EMBED_MODEL)
+
+sessions = {}
+
+
+def new_session():
+    session_id = str(uuid.uuid4())
+    sessions[session_id] = {
+        "documents": [],
+        "chunks": [],
+        "vectors": None,
+        "history": [],
+    }
+    return session_id
+
+
+def get_session(session_id: str):
+    if not session_id:
+        session_id = new_session()
+    if session_id not in sessions:
+        sessions[session_id] = {
+            "documents": [],
+            "chunks": [],
+            "vectors": None,
+            "history": [],
+        }
+    return session_id, sessions[session_id]
+
+
+def split_text(text: str):
+    text = " ".join(text.split())
+    if not text:
+        return []
+
+    chunks = []
+    start = 0
+
+    while start < len(text):
+        end = min(start + CHUNK_SIZE, len(text))
+        piece = text[start:end].strip()
+
+        if piece:
+            chunks.append(piece)
+
+        if end >= len(text):
+            break
+
+        start = max(end - CHUNK_OVERLAP, start + 1)
+
+    return chunks
+
+
+def rebuild_index(session):
+    if not session["chunks"]:
+        session["vectors"] = None
+        return
+
+    texts = [item["text"] for item in session["chunks"]]
+    vectors = embedder.encode(
+        texts,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+        show_progress_bar=False,
+    ).astype("float32")
+
+    index = faiss.IndexFlatIP(vectors.shape[1])
+    index.add(vectors)
+    session["vectors"] = index
+
+
+def search_chunks(session, query, top_k=TOP_K):
+    if not session["chunks"] or session["vectors"] is None:
+        return []
+
+    query_vector = embedder.encode(
+        [query],
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+        show_progress_bar=False,
+    ).astype("float32")
+
+    count = min(top_k, len(session["chunks"]))
+    scores, indices = session["vectors"].search(query_vector, count)
+
+    results = []
+
+    for score, index in zip(scores[0], indices[0]):
+        if index < 0:
+            continue
+
+        item = session["chunks"][int(index)]
+
+        results.append({
+            "text": item["text"],
+            "source": item["source"],
+            "page": item["page"],
+            "score": float(score),
+        })
+
+    return results
+
+
+def ollama_answer(messages, num_predict=260):
+    try:
+        response = ollama_client.chat(
+            model=MODEL,
+            messages=messages,
+            options={
+                "temperature": 0.1,
+                "num_ctx": 2048,
+                "num_predict": num_predict,
+            },
+            keep_alive="10m",
+        )
+        return response["message"]["content"].strip()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Ollama error: {str(exc)}. Make sure 'ollama run qwen2.5:3b' is running.",
+        )
 
 
 class ChatRequest(BaseModel):
@@ -45,172 +165,61 @@ class ChatRequest(BaseModel):
     question: str
 
 
+class SearchRequest(BaseModel):
+    session_id: str
+    query: str
+    top_k: int = TOP_K
+
+
 class SummaryRequest(BaseModel):
     session_id: str
 
 
-def split_text(text: str) -> List[str]:
-    text = " ".join(text.split())
-    if not text:
-        return []
-
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = min(start + CHUNK_SIZE, len(text))
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-        if end >= len(text):
-            break
-        start = max(end - CHUNK_OVERLAP, start + 1)
-    return chunks
-
-
-def extract_pdf(contents: bytes) -> str:
-    reader = PdfReader(io.BytesIO(contents))
-    pages = []
-    for page in reader.pages:
-        text = page.extract_text() or ""
-        if text.strip():
-            pages.append(text)
-    return "\n".join(pages).strip()
-
-
-def get_session(session_id: str) -> dict:
-    if session_id not in sessions:
-        sessions[session_id] = {
-            "index": None,
-            "chunks": [],
-            "documents": [],
-            "history": [],
-            "total_pages": 0,
-        }
-    return sessions[session_id]
-
-
-def rebuild_index(session: dict):
-    if not session["chunks"]:
-        session["index"] = None
-        return
-
-    texts = [item["text"] for item in session["chunks"]]
-    vectors = embedding_model.encode(
-        texts,
-        normalize_embeddings=True,
-        show_progress_bar=False,
-    )
-    vectors = np.asarray(vectors, dtype="float32")
-    index = faiss.IndexFlatIP(vectors.shape[1])
-    index.add(vectors)
-    session["index"] = index
-
-
-def search_chunks(session: dict, question: str):
-    if session["index"] is None:
-        return []
-
-    query_vector = embedding_model.encode(
-        [question],
-        normalize_embeddings=True,
-        show_progress_bar=False,
-    )
-    query_vector = np.asarray(query_vector, dtype="float32")
-    scores, indices = session["index"].search(query_vector, min(TOP_K, len(session["chunks"])))
-
-    results = []
-    for score, index in zip(scores[0], indices[0]):
-        if index >= 0:
-            item = dict(session["chunks"][int(index)])
-            item["score"] = float(score)
-            results.append(item)
-    return results
-
-
-def generate_answer(question: str, results: list) -> str:
-    context = "\n\n".join(
-        f"Source: {item['source']}\n{item['text']}" for item in results
-    )
-
-    prompt = f"""
-You are an AI document assistant.
-
-Answer the user's question using only the document context below.
-
-Rules:
-- Do not invent facts.
-- Do not use outside knowledge.
-- If the answer is not supported by the context, clearly say that you could not find the answer in the uploaded documents.
-- Keep the response clear and useful.
-- Use short paragraphs or bullets when helpful.
-
-DOCUMENT CONTEXT:
-{context}
-
-USER QUESTION:
-{question}
-
-ANSWER:
-"""
-
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0,
-        messages=[
-            {"role": "system", "content": "You answer questions from provided documents."},
-            {"role": "user", "content": prompt},
-        ],
-    )
-    return response.choices[0].message.content.strip()
-
-
-def generate_summary(text: str) -> str:
-    text = text[:30000]
-    prompt = f"""
-Summarize the uploaded documents using only the text provided.
-
-Use this structure:
-
-## Overview
-## Key Points
-## Important Details
-## Conclusion
-
-Do not invent information.
-
-DOCUMENTS:
-{text}
-"""
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0.2,
-        messages=[
-            {"role": "system", "content": "You create accurate document summaries."},
-            {"role": "user", "content": prompt},
-        ],
-    )
-    return response.choices[0].message.content.strip()
+@app.get("/")
+def root():
+    return {"name": "DocuMind AI", "status": "online"}
 
 
 @app.get("/api/health")
 def health():
-    return {"status": "online", "service": "AI Document Chat API"}
+    ollama_status = "offline"
+
+    try:
+        ollama_client.list()
+        ollama_status = "online"
+    except Exception:
+        pass
+
+    return {
+        "name": "DocuMind AI",
+        "status": "online",
+        "model": MODEL,
+        "ollama": ollama_status,
+    }
 
 
 @app.post("/api/session")
 def create_session():
-    session_id = str(uuid.uuid4())
-    get_session(session_id)
+    session_id = new_session()
     return {"session_id": session_id}
 
 
 @app.get("/api/documents")
 def documents(session_id: str):
-    session = get_session(session_id)
+    session_id, session = get_session(session_id)
+
     return {
-        "documents": session["documents"],
+        "session_id": session_id,
+        "documents": [
+            {
+                "name": item["name"],
+                "pages": item["pages"],
+                "chunks": item["chunks"],
+            }
+            for item in session["documents"]
+        ],
+        "pages": sum(item["pages"] for item in session["documents"]),
         "chunks": len(session["chunks"]),
-        "pages": session["total_pages"],
     }
 
 
@@ -219,119 +228,261 @@ async def upload_documents(
     session_id: str = Form(...),
     files: List[UploadFile] = File(...),
 ):
-    session = get_session(session_id)
+    session_id, session = get_session(session_id)
+
+    if not files:
+        raise HTTPException(status_code=400, detail="Please select at least one PDF.")
+
     uploaded = []
-    errors = []
 
     for file in files:
-        if not file.filename.lower().endswith(".pdf"):
-            errors.append({"file": file.filename, "error": "Only PDF files are supported."})
+        if not file.filename:
             continue
 
-        contents = await file.read()
-        if len(contents) > MAX_FILE_SIZE:
-            errors.append({"file": file.filename, "error": "File exceeds the 20 MB limit."})
-            continue
+        if not file.filename.lower().endswith(".pdf"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{file.filename}: only PDF files are supported.",
+            )
+
+        data = await file.read()
+
+        if len(data) > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail=f"{file.filename}: maximum file size is 20 MB.",
+            )
 
         try:
-            text = extract_pdf(contents)
-            if not text:
-                raise ValueError("No readable text was found in this PDF.")
+            reader = PdfReader(io.BytesIO(data))
+            page_count = len(reader.pages)
+            file_chunks = []
 
-            chunks = split_text(text)
-            for chunk in chunks:
-                session["chunks"].append(
-                    {
+            for page_number, page in enumerate(reader.pages, start=1):
+                text = page.extract_text() or ""
+                page_chunks = split_text(text)
+
+                for chunk_number, chunk in enumerate(page_chunks, start=1):
+                    file_chunks.append({
                         "text": chunk,
                         "source": file.filename,
-                    }
+                        "page": page_number,
+                        "chunk": chunk_number,
+                    })
+
+            if not file_chunks:
+                raise ValueError(
+                    "No extractable text was found. This may be a scanned/image-only PDF."
                 )
 
-            reader = PdfReader(io.BytesIO(contents))
-            page_count = len(reader.pages)
-            session["total_pages"] += page_count
-            session["documents"].append(
-                {
-                    "name": file.filename,
-                    "pages": page_count,
-                    "chunks": len(chunks),
-                }
-            )
-            uploaded.append(
-                {
-                    "name": file.filename,
-                    "pages": page_count,
-                    "chunks": len(chunks),
-                }
-            )
-        except Exception as exc:
-            errors.append({"file": file.filename, "error": str(exc)})
+            session["documents"] = [
+                item for item in session["documents"]
+                if item["name"] != file.filename
+            ]
 
-    if uploaded:
+            session["chunks"] = [
+                item for item in session["chunks"]
+                if item["source"] != file.filename
+            ]
+
+            session["documents"].append({
+                "name": file.filename,
+                "pages": page_count,
+                "chunks": len(file_chunks),
+            })
+
+            session["chunks"].extend(file_chunks)
+
+            uploaded.append({
+                "name": file.filename,
+                "pages": page_count,
+                "chunks": len(file_chunks),
+            })
+
+        except HTTPException:
+            raise
+        except Exception as exc:
+            traceback.print_exc()
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not process {file.filename}: {str(exc)}",
+            )
+
+    if not uploaded:
+        raise HTTPException(status_code=400, detail="No valid PDF was uploaded.")
+
+    try:
         rebuild_index(session)
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"PDF text was extracted, but FAISS indexing failed: {str(exc)}",
+        )
 
     return {
+        "session_id": session_id,
         "uploaded": uploaded,
-        "errors": errors,
         "documents": session["documents"],
+        "pages": sum(item["pages"] for item in session["documents"]),
         "chunks": len(session["chunks"]),
-        "pages": session["total_pages"],
+        "message": "PDF indexed successfully.",
+    }
+
+
+@app.post("/api/search")
+def search(request: SearchRequest):
+    session_id, session = get_session(request.session_id)
+
+    query = request.query.strip()
+
+    if not query:
+        raise HTTPException(status_code=400, detail="Search query is empty.")
+
+    results = search_chunks(
+        session,
+        query,
+        max(1, min(request.top_k, 8)),
+    )
+
+    return {
+        "session_id": session_id,
+        "query": query,
+        "results": results,
     }
 
 
 @app.post("/api/chat")
 def chat(request: ChatRequest):
+    session_id, session = get_session(request.session_id)
+
     question = request.question.strip()
+
     if not question:
-        raise HTTPException(status_code=400, detail="Question is required.")
+        raise HTTPException(status_code=400, detail="Question is empty.")
 
-    session = get_session(request.session_id)
-    if session["index"] is None:
-        raise HTTPException(status_code=400, detail="Upload and process a PDF first.")
+    results = search_chunks(session, question, TOP_K)
 
-    results = search_chunks(session, question)
     if not results:
-        raise HTTPException(status_code=404, detail="No relevant document content was found.")
+        return {
+            "session_id": session_id,
+            "answer": "Please upload a PDF first. I can only answer questions using your uploaded documents.",
+            "sources": [],
+        }
 
-    answer = generate_answer(question, results)
+    context_parts = []
 
-    sources = []
-    seen = set()
-    for item in results:
-        if item["source"] not in seen:
-            sources.append(item["source"])
-            seen.add(item["source"])
+    for i, item in enumerate(results, start=1):
+        context_parts.append(
+            f"[Source {i}] {item['source']} — page {item['page']}\n{item['text']}"
+        )
 
-    session["history"].append(
-        {"question": question, "answer": answer, "sources": sources}
-    )
+    context = "\n\n".join(context_parts)
+
+    history = session["history"][-4:]
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are DocuMind AI, a document-grounded assistant. "
+                "Answer only from the supplied document context. "
+                "If the answer is not present, clearly say that it was not found "
+                "in the uploaded documents. Do not invent facts. "
+                "Keep answers concise and useful. "
+                "Mention page numbers when relevant."
+            ),
+        }
+    ]
+
+    messages.extend(history)
+
+    messages.append({
+        "role": "user",
+        "content": (
+            f"DOCUMENT CONTEXT:\n{context}\n\n"
+            f"QUESTION:\n{question}\n\n"
+            "Answer directly using only the document context."
+        ),
+    })
+
+    answer = ollama_answer(messages, 260)
+
+    session["history"].append({
+        "role": "user",
+        "content": question,
+    })
+    session["history"].append({
+        "role": "assistant",
+        "content": answer,
+    })
 
     return {
+        "session_id": session_id,
         "answer": answer,
-        "sources": sources,
-        "matches": [
-            {
-                "source": item["source"],
-                "score": round(item["score"], 3),
-            }
+        "sources": [
+            f"{item['source']} · p. {item['page']}"
             for item in results
         ],
+        "matches": results,
     }
 
 
 @app.post("/api/summary")
 def summary(request: SummaryRequest):
-    session = get_session(request.session_id)
-    if not session["chunks"]:
-        raise HTTPException(status_code=400, detail="Upload a PDF first.")
+    session_id, session = get_session(request.session_id)
 
-    combined = "\n\n".join(
-        f"{item['source']}\n{item['text']}" for item in session["chunks"]
+    if not session["chunks"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Upload a PDF before generating a summary.",
+        )
+
+    selected = session["chunks"][:8]
+
+    context = "\n\n".join(
+        f"{item['source']} — page {item['page']}\n{item['text']}"
+        for item in selected
     )
-    return {"summary": generate_summary(combined)}
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Create a concise summary of the supplied document text. "
+                "Use only the supplied text. Do not invent information."
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"DOCUMENT TEXT:\n{context}\n\nCreate a concise summary.",
+        },
+    ]
+
+    answer = ollama_answer(messages, 320)
+
+    return {
+        "session_id": session_id,
+        "summary": answer,
+    }
+
+
+@app.get("/api/model")
+def model():
+    return {
+        "model": MODEL,
+        "provider": "Ollama",
+        "embedding_model": EMBED_MODEL,
+        "vector_store": "FAISS",
+    }
 
 
 @app.delete("/api/session/{session_id}")
-def clear_session(session_id: str):
+def delete_session(session_id: str):
     sessions.pop(session_id, None)
-    return {"message": "Session cleared."}
+    return {"success": True}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)
