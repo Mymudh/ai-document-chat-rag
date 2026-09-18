@@ -4,40 +4,16 @@ import uuid
 import traceback
 from typing import List
 
-import faiss
-import numpy as np
-import ollama
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from pypdf import PdfReader
-from sentence_transformers import SentenceTransformer
 
+app = FastAPI(title="DocuMind AI API")
 
-app = FastAPI(
-    title="DocuMind AI API",
-    version="1.0.0",
-    description="AI-powered RAG document assistant backend"
+FRONTEND_URL = os.getenv(
+    "FRONTEND_URL",
+    "https://ai-document-chat-rag.vercel.app"
 )
-
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:5174",
-        "http://127.0.0.1:5174",
-        "http://localhost:5175",
-        "http://127.0.0.1:5175",
-        "https://ai-document-chat-rag.vercel.app",
-        "https://ai-document-chat-5gq60cgq9-mymudhs-projects.vercel.app",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 
 MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
@@ -51,21 +27,59 @@ CHUNK_SIZE = 700
 CHUNK_OVERLAP = 100
 TOP_K = 4
 
+ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
+    "http://localhost:5175",
+    "http://127.0.0.1:5175",
+    "https://ai-document-chat-rag.vercel.app",
+    "https://ai-document-chat-5gq60cgq9-mymudhs-projects.vercel.app",
+]
 
-ollama_client = ollama.Client(host=OLLAMA_HOST)
+if FRONTEND_URL and FRONTEND_URL not in ALLOWED_ORIGINS:
+    ALLOWED_ORIGINS.append(FRONTEND_URL)
 
-embedder = None
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 sessions = {}
 
+_embedder = None
+_ollama_client = None
+
 
 def get_embedder():
-    global embedder
+    global _embedder
 
-    if embedder is None:
-        embedder = SentenceTransformer(EMBED_MODEL)
+    if _embedder is None:
+        from sentence_transformers import SentenceTransformer
 
-    return embedder
+        _embedder = SentenceTransformer(
+            EMBED_MODEL,
+            device="cpu"
+        )
+
+    return _embedder
+
+
+def get_ollama_client():
+    global _ollama_client
+
+    if _ollama_client is None:
+        import ollama
+
+        _ollama_client = ollama.Client(
+            host=OLLAMA_HOST
+        )
+
+    return _ollama_client
 
 
 def new_session():
@@ -106,7 +120,10 @@ def split_text(text: str):
     start = 0
 
     while start < len(text):
-        end = min(start + CHUNK_SIZE, len(text))
+        end = min(
+            start + CHUNK_SIZE,
+            len(text)
+        )
 
         piece = text[start:end].strip()
 
@@ -129,19 +146,27 @@ def rebuild_index(session):
         session["vectors"] = None
         return
 
-    model = get_embedder()
+    import faiss
+    import numpy as np
+
+    embedder = get_embedder()
 
     texts = [
         item["text"]
         for item in session["chunks"]
     ]
 
-    vectors = model.encode(
+    vectors = embedder.encode(
         texts,
         normalize_embeddings=True,
         convert_to_numpy=True,
         show_progress_bar=False,
-    ).astype("float32")
+    )
+
+    vectors = np.asarray(
+        vectors,
+        dtype="float32"
+    )
 
     index = faiss.IndexFlatIP(
         vectors.shape[1]
@@ -152,24 +177,35 @@ def rebuild_index(session):
     session["vectors"] = index
 
 
-def search_chunks(session, query, top_k=TOP_K):
+def search_chunks(
+    session,
+    query,
+    top_k=TOP_K
+):
     if (
         not session["chunks"]
         or session["vectors"] is None
     ):
         return []
 
-    model = get_embedder()
+    import numpy as np
 
-    query_vector = model.encode(
+    embedder = get_embedder()
+
+    query_vector = embedder.encode(
         [query],
         normalize_embeddings=True,
         convert_to_numpy=True,
         show_progress_bar=False,
-    ).astype("float32")
+    )
+
+    query_vector = np.asarray(
+        query_vector,
+        dtype="float32"
+    )
 
     count = min(
-        top_k,
+        max(1, top_k),
         len(session["chunks"])
     )
 
@@ -201,9 +237,14 @@ def search_chunks(session, query, top_k=TOP_K):
     return results
 
 
-def ollama_answer(messages, num_predict=260):
+def ollama_answer(
+    messages,
+    num_predict=260
+):
     try:
-        response = ollama_client.chat(
+        client = get_ollama_client()
+
+        response = client.chat(
             model=MODEL,
             messages=messages,
             options={
@@ -214,15 +255,19 @@ def ollama_answer(messages, num_predict=260):
             keep_alive="10m",
         )
 
-        return response["message"]["content"].strip()
+        return response[
+            "message"
+        ][
+            "content"
+        ].strip()
 
     except Exception as exc:
         raise HTTPException(
             status_code=503,
             detail=(
                 f"Ollama error: {str(exc)}. "
-                f"Make sure Ollama is running and model "
-                f"'{MODEL}' is available."
+                f"Make sure the configured Ollama server "
+                f"is running and model '{MODEL}' is available."
             ),
         )
 
@@ -247,8 +292,7 @@ def root():
     return {
         "name": "DocuMind AI",
         "status": "online",
-        "service": "FastAPI backend",
-        "docs": "/docs",
+        "service": "FastAPI",
     }
 
 
@@ -265,10 +309,11 @@ def health():
     ollama_status = "offline"
 
     try:
-        ollama_client.list()
+        client = get_ollama_client()
+        client.list()
         ollama_status = "online"
     except Exception:
-        pass
+        ollama_status = "offline"
 
     return {
         "name": "DocuMind AI",
@@ -308,7 +353,9 @@ def documents(session_id: str):
             item["pages"]
             for item in session["documents"]
         ),
-        "chunks": len(session["chunks"]),
+        "chunks": len(
+            session["chunks"]
+        ),
     }
 
 
@@ -324,7 +371,7 @@ async def upload_documents(
     if not files:
         raise HTTPException(
             status_code=400,
-            detail="Please select at least one PDF.",
+            detail="Please select at least one PDF."
         )
 
     uploaded = []
@@ -334,11 +381,13 @@ async def upload_documents(
         if not file.filename:
             continue
 
-        if not file.filename.lower().endswith(".pdf"):
+        filename = file.filename.strip()
+
+        if not filename.lower().endswith(".pdf"):
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    f"{file.filename}: "
+                    f"{filename}: "
                     "only PDF files are supported."
                 ),
             )
@@ -349,36 +398,42 @@ async def upload_documents(
             raise HTTPException(
                 status_code=413,
                 detail=(
-                    f"{file.filename}: "
+                    f"{filename}: "
                     "maximum file size is 20 MB."
                 ),
             )
 
         try:
+            from pypdf import PdfReader
+
             reader = PdfReader(
                 io.BytesIO(data)
             )
 
-            page_count = len(reader.pages)
+            page_count = len(
+                reader.pages
+            )
 
             file_chunks = []
 
             for page_number, page in enumerate(
                 reader.pages,
-                start=1,
+                start=1
             ):
                 text = page.extract_text() or ""
 
-                page_chunks = split_text(text)
+                page_chunks = split_text(
+                    text
+                )
 
                 for chunk_number, chunk in enumerate(
                     page_chunks,
-                    start=1,
+                    start=1
                 ):
                     file_chunks.append(
                         {
                             "text": chunk,
-                            "source": file.filename,
+                            "source": filename,
                             "page": page_number,
                             "chunk": chunk_number,
                         }
@@ -387,24 +442,24 @@ async def upload_documents(
             if not file_chunks:
                 raise ValueError(
                     "No extractable text was found. "
-                    "This may be a scanned/image-only PDF."
+                    "This may be a scanned or image-only PDF."
                 )
 
             session["documents"] = [
                 item
                 for item in session["documents"]
-                if item["name"] != file.filename
+                if item["name"] != filename
             ]
 
             session["chunks"] = [
                 item
                 for item in session["chunks"]
-                if item["source"] != file.filename
+                if item["source"] != filename
             ]
 
             session["documents"].append(
                 {
-                    "name": file.filename,
+                    "name": filename,
                     "pages": page_count,
                     "chunks": len(file_chunks),
                 }
@@ -416,7 +471,7 @@ async def upload_documents(
 
             uploaded.append(
                 {
-                    "name": file.filename,
+                    "name": filename,
                     "pages": page_count,
                     "chunks": len(file_chunks),
                 }
@@ -432,14 +487,14 @@ async def upload_documents(
                 status_code=400,
                 detail=(
                     f"Could not process "
-                    f"{file.filename}: {str(exc)}"
+                    f"{filename}: {str(exc)}"
                 ),
             )
 
     if not uploaded:
         raise HTTPException(
             status_code=400,
-            detail="No valid PDF was uploaded.",
+            detail="No valid PDF was uploaded."
         )
 
     try:
@@ -465,13 +520,17 @@ async def upload_documents(
             item["pages"]
             for item in session["documents"]
         ),
-        "chunks": len(session["chunks"]),
+        "chunks": len(
+            session["chunks"]
+        ),
         "message": "PDF indexed successfully.",
     }
 
 
 @app.post("/api/search")
-def search(request: SearchRequest):
+def search(
+    request: SearchRequest
+):
     session_id, session = get_session(
         request.session_id
     )
@@ -481,16 +540,18 @@ def search(request: SearchRequest):
     if not query:
         raise HTTPException(
             status_code=400,
-            detail="Search query is empty.",
+            detail="Search query is empty."
         )
+
+    top_k = max(
+        1,
+        min(request.top_k, 8)
+    )
 
     results = search_chunks(
         session,
         query,
-        max(
-            1,
-            min(request.top_k, 8)
-        ),
+        top_k
     )
 
     return {
@@ -501,7 +562,9 @@ def search(request: SearchRequest):
 
 
 @app.post("/api/chat")
-def chat(request: ChatRequest):
+def chat(
+    request: ChatRequest
+):
     session_id, session = get_session(
         request.session_id
     )
@@ -511,13 +574,13 @@ def chat(request: ChatRequest):
     if not question:
         raise HTTPException(
             status_code=400,
-            detail="Question is empty.",
+            detail="Question is empty."
         )
 
     results = search_chunks(
         session,
         question,
-        TOP_K,
+        TOP_K
     )
 
     if not results:
@@ -529,13 +592,14 @@ def chat(request: ChatRequest):
                 "using your uploaded documents."
             ),
             "sources": [],
+            "matches": [],
         }
 
     context_parts = []
 
     for i, item in enumerate(
         results,
-        start=1,
+        start=1
     ):
         context_parts.append(
             f"[Source {i}] "
@@ -586,7 +650,7 @@ def chat(request: ChatRequest):
 
     answer = ollama_answer(
         messages,
-        260,
+        260
     )
 
     session["history"].append(
@@ -615,7 +679,9 @@ def chat(request: ChatRequest):
 
 
 @app.post("/api/summary")
-def summary(request: SummaryRequest):
+def summary(
+    request: SummaryRequest
+):
     session_id, session = get_session(
         request.session_id
     )
@@ -632,9 +698,11 @@ def summary(request: SummaryRequest):
     selected = session["chunks"][:8]
 
     context = "\n\n".join(
-        f"{item['source']} — "
-        f"page {item['page']}\n"
-        f"{item['text']}"
+        (
+            f"{item['source']} — "
+            f"page {item['page']}\n"
+            f"{item['text']}"
+        )
         for item in selected
     )
 
@@ -660,7 +728,7 @@ def summary(request: SummaryRequest):
 
     answer = ollama_answer(
         messages,
-        320,
+        320
     )
 
     return {
@@ -680,10 +748,12 @@ def model():
 
 
 @app.delete("/api/session/{session_id}")
-def delete_session(session_id: str):
+def delete_session(
+    session_id: str
+):
     sessions.pop(
         session_id,
-        None,
+        None
     )
 
     return {
@@ -701,5 +771,5 @@ if __name__ == "__main__":
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=port,
+        port=port
     )
