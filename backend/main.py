@@ -201,6 +201,7 @@ def rebuild_index(session):
 
     vectors = embedder.encode(
         texts,
+        batch_size=16,
         normalize_embeddings=True,
         convert_to_numpy=True,
         show_progress_bar=False,
