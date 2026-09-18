@@ -1,7 +1,8 @@
 import io
 import os
-import uuid
+import time
 import traceback
+import uuid
 from typing import List
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -10,6 +11,10 @@ from pydantic import BaseModel
 
 app = FastAPI(title="DocuMind AI API")
 
+# =========================
+# CONFIGURATION
+# =========================
+
 FRONTEND_URL = os.getenv(
     "FRONTEND_URL",
     "https://ai-document-chat-rag.vercel.app"
@@ -17,8 +22,8 @@ FRONTEND_URL = os.getenv(
 
 LLM_PROVIDER = os.getenv(
     "LLM_PROVIDER",
-    "ollama"
-)
+    "gemini"
+).lower()
 
 OLLAMA_MODEL = os.getenv(
     "OLLAMA_MODEL",
@@ -50,6 +55,11 @@ CHUNK_SIZE = 700
 CHUNK_OVERLAP = 100
 TOP_K = 4
 
+
+# =========================
+# CORS
+# =========================
+
 ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
@@ -58,7 +68,6 @@ ALLOWED_ORIGINS = [
     "http://localhost:5175",
     "http://127.0.0.1:5175",
     "https://ai-document-chat-rag.vercel.app",
-    "https://ai-document-chat-5gq60cgq9-mymudhs-projects.vercel.app",
 ]
 
 if FRONTEND_URL and FRONTEND_URL not in ALLOWED_ORIGINS:
@@ -67,10 +76,16 @@ if FRONTEND_URL and FRONTEND_URL not in ALLOWED_ORIGINS:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# =========================
+# SESSION STORAGE
+# =========================
 
 sessions = {}
 
@@ -79,19 +94,39 @@ _ollama_client = None
 _gemini_client = None
 
 
+# =========================
+# EMBEDDING MODEL
+# =========================
+
 def get_embedder():
     global _embedder
 
     if _embedder is None:
         from sentence_transformers import SentenceTransformer
 
+        print(
+            f"Loading embedding model: {EMBED_MODEL}",
+            flush=True
+        )
+
+        start = time.time()
+
         _embedder = SentenceTransformer(
             EMBED_MODEL,
             device="cpu"
         )
 
+        print(
+            f"Embedding model ready in {time.time() - start:.1f}s",
+            flush=True
+        )
+
     return _embedder
 
+
+# =========================
+# OLLAMA
+# =========================
 
 def get_ollama_client():
     global _ollama_client
@@ -105,6 +140,10 @@ def get_ollama_client():
 
     return _ollama_client
 
+
+# =========================
+# GEMINI
+# =========================
 
 def get_gemini_client():
     global _gemini_client
@@ -125,162 +164,6 @@ def get_gemini_client():
     return _gemini_client
 
 
-def new_session():
-    session_id = str(uuid.uuid4())
-
-    sessions[session_id] = {
-        "documents": [],
-        "chunks": [],
-        "vectors": None,
-        "history": [],
-    }
-
-    return session_id
-
-
-def get_session(session_id: str):
-    if not session_id:
-        session_id = new_session()
-
-    if session_id not in sessions:
-        sessions[session_id] = {
-            "documents": [],
-            "chunks": [],
-            "vectors": None,
-            "history": [],
-        }
-
-    return session_id, sessions[session_id]
-
-
-def split_text(text: str):
-    text = " ".join(text.split())
-
-    if not text:
-        return []
-
-    chunks = []
-    start = 0
-
-    while start < len(text):
-        end = min(
-            start + CHUNK_SIZE,
-            len(text)
-        )
-
-        piece = text[start:end].strip()
-
-        if piece:
-            chunks.append(piece)
-
-        if end >= len(text):
-            break
-
-        start = max(
-            end - CHUNK_OVERLAP,
-            start + 1
-        )
-
-    return chunks
-
-
-def rebuild_index(session):
-    if not session["chunks"]:
-        session["vectors"] = None
-        return
-
-    import faiss
-    import numpy as np
-
-    embedder = get_embedder()
-
-    texts = [
-        item["text"]
-        for item in session["chunks"]
-    ]
-
-    vectors = embedder.encode(
-        texts,
-        batch_size=16,
-        normalize_embeddings=True,
-        convert_to_numpy=True,
-        show_progress_bar=False,
-    )
-
-    vectors = np.asarray(
-        vectors,
-        dtype="float32"
-    )
-
-    index = faiss.IndexFlatIP(
-        vectors.shape[1]
-    )
-
-    index.add(vectors)
-
-    session["vectors"] = index
-
-
-def search_chunks(
-    session,
-    query,
-    top_k=TOP_K
-):
-    if (
-        not session["chunks"]
-        or session["vectors"] is None
-    ):
-        return []
-
-    import numpy as np
-
-    embedder = get_embedder()
-
-    query_vector = embedder.encode(
-        [query],
-        normalize_embeddings=True,
-        convert_to_numpy=True,
-        show_progress_bar=False,
-    )
-
-    query_vector = np.asarray(
-        query_vector,
-        dtype="float32"
-    )
-
-    count = min(
-        max(1, top_k),
-        len(session["chunks"])
-    )
-
-    scores, indices = session["vectors"].search(
-        query_vector,
-        count
-    )
-
-    results = []
-
-    for score, index in zip(
-        scores[0],
-        indices[0]
-    ):
-        if index < 0:
-            continue
-
-        item = session["chunks"][int(index)]
-
-        results.append(
-            {
-                "text": item["text"],
-                "source": item["source"],
-                "page": item["page"],
-                "score": float(score),
-            }
-        )
-
-    return results
-
-
 def gemini_answer(
     messages,
     num_predict=260
@@ -290,11 +173,11 @@ def gemini_answer(
 
         client = get_gemini_client()
 
-        system_instruction = ""
-
+        system_parts = []
         conversation_parts = []
 
         for message in messages:
+
             role = message.get(
                 "role",
                 "user"
@@ -306,9 +189,7 @@ def gemini_answer(
             )
 
             if role == "system":
-                system_instruction += (
-                    content + "\n\n"
-                )
+                system_parts.append(content)
 
             elif role == "user":
                 conversation_parts.append(
@@ -320,18 +201,22 @@ def gemini_answer(
                     f"ASSISTANT:\n{content}"
                 )
 
+        system_instruction = "\n\n".join(
+            system_parts
+        ).strip()
+
         prompt = "\n\n".join(
             conversation_parts
-        )
+        ).strip()
 
         response = client.models.generate_content(
             model=GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
-                system_instruction=system_instruction.strip(),
+                system_instruction=system_instruction,
                 temperature=0.1,
-                max_output_tokens=num_predict,
-            ),
+                max_output_tokens=num_predict
+            )
         )
 
         answer = response.text
@@ -355,6 +240,10 @@ def gemini_answer(
         )
 
 
+# =========================
+# OLLAMA ANSWER
+# =========================
+
 def ollama_answer(
     messages,
     num_predict=260
@@ -368,9 +257,9 @@ def ollama_answer(
             options={
                 "temperature": 0.1,
                 "num_ctx": 2048,
-                "num_predict": num_predict,
+                "num_predict": num_predict
             },
-            keep_alive="10m",
+            keep_alive="10m"
         )
 
         return response[
@@ -388,15 +277,19 @@ def ollama_answer(
                 f"Ollama error: {str(exc)}. "
                 f"Make sure Ollama is running "
                 f"and model '{OLLAMA_MODEL}' is available."
-            ),
+            )
         )
 
+
+# =========================
+# LLM SELECTOR
+# =========================
 
 def llm_answer(
     messages,
     num_predict=260
 ):
-    if LLM_PROVIDER.lower() == "gemini":
+    if LLM_PROVIDER == "gemini":
         return gemini_answer(
             messages,
             num_predict
@@ -408,44 +301,282 @@ def llm_answer(
     )
 
 
+# =========================
+# SESSION FUNCTIONS
+# =========================
+
+def new_session():
+
+    session_id = str(
+        uuid.uuid4()
+    )
+
+    sessions[session_id] = {
+        "documents": [],
+        "chunks": [],
+        "vectors": None,
+        "history": []
+    }
+
+    return session_id
+
+
+def get_session(
+    session_id: str
+):
+
+    if not session_id:
+        session_id = new_session()
+
+    if session_id not in sessions:
+
+        sessions[session_id] = {
+            "documents": [],
+            "chunks": [],
+            "vectors": None,
+            "history": []
+        }
+
+    return (
+        session_id,
+        sessions[session_id]
+    )
+
+
+# =========================
+# TEXT CHUNKING
+# =========================
+
+def split_text(
+    text: str
+):
+
+    text = " ".join(
+        text.split()
+    )
+
+    if not text:
+        return []
+
+    chunks = []
+
+    start = 0
+
+    while start < len(text):
+
+        end = min(
+            start + CHUNK_SIZE,
+            len(text)
+        )
+
+        piece = text[
+            start:end
+        ].strip()
+
+        if piece:
+            chunks.append(
+                piece
+            )
+
+        if end >= len(text):
+            break
+
+        start = max(
+            end - CHUNK_OVERLAP,
+            start + 1
+        )
+
+    return chunks
+
+
+# =========================
+# FAISS INDEX
+# =========================
+
+def rebuild_index(
+    session
+):
+
+    if not session["chunks"]:
+
+        session["vectors"] = None
+
+        return
+
+    import faiss
+    import numpy as np
+
+    embedder = get_embedder()
+
+    texts = [
+        item["text"]
+        for item in session["chunks"]
+    ]
+
+    print(
+        f"Creating embeddings for {len(texts)} chunks...",
+        flush=True
+    )
+
+    start = time.time()
+
+    vectors = embedder.encode(
+        texts,
+        batch_size=32,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+        show_progress_bar=False
+    )
+
+    vectors = np.asarray(
+        vectors,
+        dtype="float32"
+    )
+
+    index = faiss.IndexFlatIP(
+        vectors.shape[1]
+    )
+
+    index.add(
+        vectors
+    )
+
+    session["vectors"] = index
+
+    print(
+        f"FAISS index ready: {len(texts)} chunks "
+        f"in {time.time() - start:.1f}s",
+        flush=True
+    )
+
+
+# =========================
+# SEARCH
+# =========================
+
+def search_chunks(
+    session,
+    query,
+    top_k=TOP_K
+):
+
+    if (
+        not session["chunks"]
+        or session["vectors"] is None
+    ):
+        return []
+
+    import numpy as np
+
+    embedder = get_embedder()
+
+    query_vector = embedder.encode(
+        [query],
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+        show_progress_bar=False
+    )
+
+    query_vector = np.asarray(
+        query_vector,
+        dtype="float32"
+    )
+
+    count = min(
+        max(1, top_k),
+        len(session["chunks"])
+    )
+
+    scores, indices = session[
+        "vectors"
+    ].search(
+        query_vector,
+        count
+    )
+
+    results = []
+
+    for score, index in zip(
+        scores[0],
+        indices[0]
+    ):
+
+        if index < 0:
+            continue
+
+        item = session[
+            "chunks"
+        ][int(index)]
+
+        results.append(
+            {
+                "text": item["text"],
+                "source": item["source"],
+                "page": item["page"],
+                "score": float(score)
+            }
+        )
+
+    return results
+
+
+# =========================
+# REQUEST MODELS
+# =========================
+
 class ChatRequest(BaseModel):
+
     session_id: str
     question: str
 
 
 class SearchRequest(BaseModel):
+
     session_id: str
     query: str
     top_k: int = TOP_K
 
 
 class SummaryRequest(BaseModel):
+
     session_id: str
 
 
+# =========================
+# ROOT
+# =========================
+
 @app.get("/")
 def root():
+
     return {
         "name": "DocuMind AI",
         "status": "online",
         "service": "FastAPI",
-        "provider": LLM_PROVIDER,
+        "provider": LLM_PROVIDER
     }
 
 
+# =========================
+# HEALTH
+# =========================
+
 @app.get("/healthz")
 def healthz():
+
     return {
         "status": "ok",
-        "service": "DocuMind AI",
+        "service": "DocuMind AI"
     }
 
 
 @app.get("/api/health")
 def health():
-    provider = LLM_PROVIDER.lower()
+
+    provider = LLM_PROVIDER
 
     if provider == "gemini":
+
         llm_status = (
             "configured"
             if GEMINI_API_KEY
@@ -455,16 +586,23 @@ def health():
         model_name = GEMINI_MODEL
 
     else:
+
         ollama_status = "offline"
 
         try:
+
             client = get_ollama_client()
+
             client.list()
+
             ollama_status = "online"
+
         except Exception:
+
             ollama_status = "offline"
 
         llm_status = ollama_status
+
         model_name = OLLAMA_MODEL
 
     return {
@@ -474,12 +612,44 @@ def health():
         "model": model_name,
         "llm": llm_status,
         "embedding_model": EMBED_MODEL,
-        "vector_store": "FAISS",
+        "vector_store": "FAISS"
     }
 
 
+# =========================
+# MODEL
+# =========================
+
+@app.get("/api/model")
+def model():
+
+    if LLM_PROVIDER == "gemini":
+
+        provider = "Gemini"
+
+        model_name = GEMINI_MODEL
+
+    else:
+
+        provider = "Ollama"
+
+        model_name = OLLAMA_MODEL
+
+    return {
+        "model": model_name,
+        "provider": provider,
+        "embedding_model": EMBED_MODEL,
+        "vector_store": "FAISS"
+    }
+
+
+# =========================
+# CREATE SESSION
+# =========================
+
 @app.post("/api/session")
 def create_session():
+
     session_id = new_session()
 
     return {
@@ -487,42 +657,69 @@ def create_session():
     }
 
 
+# =========================
+# DOCUMENT LIST
+# =========================
+
 @app.get("/api/documents")
-def documents(session_id: str):
+def documents(
+    session_id: str
+):
+
     session_id, session = get_session(
         session_id
     )
 
     return {
         "session_id": session_id,
+
         "documents": [
             {
                 "name": item["name"],
                 "pages": item["pages"],
-                "chunks": item["chunks"],
+                "chunks": item["chunks"]
             }
-            for item in session["documents"]
+
+            for item in session[
+                "documents"
+            ]
         ],
+
         "pages": sum(
             item["pages"]
-            for item in session["documents"]
+            for item in session[
+                "documents"
+            ]
         ),
+
         "chunks": len(
             session["chunks"]
-        ),
+        )
     }
 
 
-@app.post("/api/documents/upload")
+# =========================
+# PDF UPLOAD
+# =========================
+
+@app.post(
+    "/api/documents/upload"
+)
 async def upload_documents(
+
     session_id: str = Form(...),
-    files: List[UploadFile] = File(...),
+
+    files: List[
+        UploadFile
+    ] = File(...)
 ):
+
     session_id, session = get_session(
         session_id
     )
 
     if not files:
+
         raise HTTPException(
             status_code=400,
             detail="Please select at least one PDF."
@@ -537,28 +734,35 @@ async def upload_documents(
 
         filename = file.filename.strip()
 
-        if not filename.lower().endswith(".pdf"):
+        if not filename.lower().endswith(
+            ".pdf"
+        ):
+
             raise HTTPException(
                 status_code=400,
                 detail=(
                     f"{filename}: "
                     "only PDF files are supported."
-                ),
+                )
             )
 
         data = await file.read()
 
         if len(data) > MAX_FILE_SIZE:
+
             raise HTTPException(
                 status_code=413,
                 detail=(
                     f"{filename}: "
                     "maximum file size is 20 MB."
-                ),
+                )
             )
 
         try:
+
             from pypdf import PdfReader
+
+            start = time.time()
 
             reader = PdfReader(
                 io.BytesIO(data)
@@ -574,6 +778,7 @@ async def upload_documents(
                 reader.pages,
                 start=1
             ):
+
                 text = page.extract_text() or ""
 
                 page_chunks = split_text(
@@ -584,16 +789,18 @@ async def upload_documents(
                     page_chunks,
                     start=1
                 ):
+
                     file_chunks.append(
                         {
                             "text": chunk,
                             "source": filename,
                             "page": page_number,
-                            "chunk": chunk_number,
+                            "chunk": chunk_number
                         }
                     )
 
             if not file_chunks:
+
                 raise ValueError(
                     "No extractable text was found. "
                     "This may be a scanned or image-only PDF."
@@ -601,13 +808,17 @@ async def upload_documents(
 
             session["documents"] = [
                 item
-                for item in session["documents"]
+                for item in session[
+                    "documents"
+                ]
                 if item["name"] != filename
             ]
 
             session["chunks"] = [
                 item
-                for item in session["chunks"]
+                for item in session[
+                    "chunks"
+                ]
                 if item["source"] != filename
             ]
 
@@ -615,7 +826,7 @@ async def upload_documents(
                 {
                     "name": filename,
                     "pages": page_count,
-                    "chunks": len(file_chunks),
+                    "chunks": len(file_chunks)
                 }
             )
 
@@ -627,14 +838,23 @@ async def upload_documents(
                 {
                     "name": filename,
                     "pages": page_count,
-                    "chunks": len(file_chunks),
+                    "chunks": len(file_chunks)
                 }
+            )
+
+            print(
+                f"PDF extracted: {filename} | "
+                f"{page_count} pages | "
+                f"{len(file_chunks)} chunks | "
+                f"{time.time() - start:.1f}s",
+                flush=True
             )
 
         except HTTPException:
             raise
 
         except Exception as exc:
+
             traceback.print_exc()
 
             raise HTTPException(
@@ -642,19 +862,24 @@ async def upload_documents(
                 detail=(
                     f"Could not process "
                     f"{filename}: {str(exc)}"
-                ),
+                )
             )
 
     if not uploaded:
+
         raise HTTPException(
             status_code=400,
             detail="No valid PDF was uploaded."
         )
 
     try:
-        rebuild_index(session)
+
+        rebuild_index(
+            session
+        )
 
     except Exception as exc:
+
         traceback.print_exc()
 
         raise HTTPException(
@@ -663,7 +888,7 @@ async def upload_documents(
                 "PDF text was extracted, "
                 "but FAISS indexing failed: "
                 f"{str(exc)}"
-            ),
+            )
         )
 
     return {
@@ -672,19 +897,26 @@ async def upload_documents(
         "documents": session["documents"],
         "pages": sum(
             item["pages"]
-            for item in session["documents"]
+            for item in session[
+                "documents"
+            ]
         ),
         "chunks": len(
             session["chunks"]
         ),
-        "message": "PDF indexed successfully.",
+        "message": "PDF indexed successfully."
     }
 
+
+# =========================
+# SEARCH API
+# =========================
 
 @app.post("/api/search")
 def search(
     request: SearchRequest
 ):
+
     session_id, session = get_session(
         request.session_id
     )
@@ -692,6 +924,7 @@ def search(
     query = request.query.strip()
 
     if not query:
+
         raise HTTPException(
             status_code=400,
             detail="Search query is empty."
@@ -699,7 +932,10 @@ def search(
 
     top_k = max(
         1,
-        min(request.top_k, 8)
+        min(
+            request.top_k,
+            8
+        )
     )
 
     results = search_chunks(
@@ -711,14 +947,19 @@ def search(
     return {
         "session_id": session_id,
         "query": query,
-        "results": results,
+        "results": results
     }
 
+
+# =========================
+# RAG CHAT
+# =========================
 
 @app.post("/api/chat")
 def chat(
     request: ChatRequest
 ):
+
     session_id, session = get_session(
         request.session_id
     )
@@ -726,6 +967,7 @@ def chat(
     question = request.question.strip()
 
     if not question:
+
         raise HTTPException(
             status_code=400,
             detail="Question is empty."
@@ -738,15 +980,19 @@ def chat(
     )
 
     if not results:
+
         return {
             "session_id": session_id,
+
             "answer": (
                 "Please upload a PDF first. "
                 "I can only answer questions "
                 "using your uploaded documents."
             ),
+
             "sources": [],
-            "matches": [],
+
+            "matches": []
         }
 
     context_parts = []
@@ -755,6 +1001,7 @@ def chat(
         results,
         start=1
     ):
+
         context_parts.append(
             f"[Source {i}] "
             f"{item['source']} — "
@@ -766,11 +1013,14 @@ def chat(
         context_parts
     )
 
-    history = session["history"][-4:]
+    history = session[
+        "history"
+    ][-4:]
 
     messages = [
         {
             "role": "system",
+
             "content": (
                 "You are DocuMind AI, "
                 "a document-grounded assistant. "
@@ -782,23 +1032,28 @@ def chat(
                 "Do not invent facts. "
                 "Keep answers concise and useful. "
                 "Mention page numbers when relevant."
-            ),
+            )
         }
     ]
 
-    messages.extend(history)
+    messages.extend(
+        history
+    )
 
     messages.append(
         {
             "role": "user",
+
             "content": (
                 f"DOCUMENT CONTEXT:\n"
                 f"{context}\n\n"
+
                 f"QUESTION:\n"
                 f"{question}\n\n"
+
                 "Answer directly using only "
                 "the document context."
-            ),
+            )
         }
     )
 
@@ -807,49 +1062,64 @@ def chat(
         260
     )
 
-    session["history"].append(
+    session[
+        "history"
+    ].append(
         {
             "role": "user",
-            "content": question,
+            "content": question
         }
     )
 
-    session["history"].append(
+    session[
+        "history"
+    ].append(
         {
             "role": "assistant",
-            "content": answer,
+            "content": answer
         }
     )
 
     return {
         "session_id": session_id,
+
         "answer": answer,
+
         "sources": [
             f"{item['source']} · p. {item['page']}"
             for item in results
         ],
-        "matches": results,
+
+        "matches": results
     }
 
+
+# =========================
+# SUMMARY
+# =========================
 
 @app.post("/api/summary")
 def summary(
     request: SummaryRequest
 ):
+
     session_id, session = get_session(
         request.session_id
     )
 
     if not session["chunks"]:
+
         raise HTTPException(
             status_code=400,
             detail=(
                 "Upload a PDF before "
                 "generating a summary."
-            ),
+            )
         )
 
-    selected = session["chunks"][:8]
+    selected = session[
+        "chunks"
+    ][:8]
 
     context = "\n\n".join(
         (
@@ -857,27 +1127,31 @@ def summary(
             f"page {item['page']}\n"
             f"{item['text']}"
         )
+
         for item in selected
     )
 
     messages = [
         {
             "role": "system",
+
             "content": (
                 "Create a concise summary "
                 "of the supplied document text. "
                 "Use only the supplied text. "
                 "Do not invent information."
-            ),
+            )
         },
+
         {
             "role": "user",
+
             "content": (
                 f"DOCUMENT TEXT:\n"
                 f"{context}\n\n"
                 "Create a concise summary."
-            ),
-        },
+            )
+        }
     ]
 
     answer = llm_answer(
@@ -887,31 +1161,21 @@ def summary(
 
     return {
         "session_id": session_id,
-        "summary": answer,
+        "summary": answer
     }
 
 
-@app.get("/api/model")
-def model():
-    if LLM_PROVIDER.lower() == "gemini":
-        provider = "Gemini"
-        model_name = GEMINI_MODEL
-    else:
-        provider = "Ollama"
-        model_name = OLLAMA_MODEL
+# =========================
+# DELETE SESSION
+# =========================
 
-    return {
-        "model": model_name,
-        "provider": provider,
-        "embedding_model": EMBED_MODEL,
-        "vector_store": "FAISS",
-    }
-
-
-@app.delete("/api/session/{session_id}")
+@app.delete(
+    "/api/session/{session_id}"
+)
 def delete_session(
     session_id: str
 ):
+
     sessions.pop(
         session_id,
         None
@@ -922,11 +1186,19 @@ def delete_session(
     }
 
 
+# =========================
+# START SERVER
+# =========================
+
 if __name__ == "__main__":
+
     import uvicorn
 
     port = int(
-        os.getenv("PORT", "8000")
+        os.getenv(
+            "PORT",
+            "8000"
+        )
     )
 
     uvicorn.run(
