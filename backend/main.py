@@ -15,8 +15,31 @@ FRONTEND_URL = os.getenv(
     "https://ai-document-chat-rag.vercel.app"
 )
 
-MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+LLM_PROVIDER = os.getenv(
+    "LLM_PROVIDER",
+    "ollama"
+)
+
+OLLAMA_MODEL = os.getenv(
+    "OLLAMA_MODEL",
+    "qwen2.5:3b"
+)
+
+OLLAMA_HOST = os.getenv(
+    "OLLAMA_HOST",
+    "http://127.0.0.1:11434"
+)
+
+GEMINI_API_KEY = os.getenv(
+    "GEMINI_API_KEY",
+    ""
+)
+
+GEMINI_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-2.5-flash"
+)
+
 EMBED_MODEL = os.getenv(
     "EMBED_MODEL",
     "sentence-transformers/all-MiniLM-L6-v2"
@@ -53,6 +76,7 @@ sessions = {}
 
 _embedder = None
 _ollama_client = None
+_gemini_client = None
 
 
 def get_embedder():
@@ -80,6 +104,25 @@ def get_ollama_client():
         )
 
     return _ollama_client
+
+
+def get_gemini_client():
+    global _gemini_client
+
+    if not GEMINI_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="GEMINI_API_KEY is not configured on the server."
+        )
+
+    if _gemini_client is None:
+        from google import genai
+
+        _gemini_client = genai.Client(
+            api_key=GEMINI_API_KEY
+        )
+
+    return _gemini_client
 
 
 def new_session():
@@ -237,6 +280,80 @@ def search_chunks(
     return results
 
 
+def gemini_answer(
+    messages,
+    num_predict=260
+):
+    try:
+        from google.genai import types
+
+        client = get_gemini_client()
+
+        system_instruction = ""
+
+        conversation_parts = []
+
+        for message in messages:
+            role = message.get(
+                "role",
+                "user"
+            )
+
+            content = message.get(
+                "content",
+                ""
+            )
+
+            if role == "system":
+                system_instruction += (
+                    content + "\n\n"
+                )
+
+            elif role == "user":
+                conversation_parts.append(
+                    f"USER:\n{content}"
+                )
+
+            elif role == "assistant":
+                conversation_parts.append(
+                    f"ASSISTANT:\n{content}"
+                )
+
+        prompt = "\n\n".join(
+            conversation_parts
+        )
+
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction.strip(),
+                temperature=0.1,
+                max_output_tokens=num_predict,
+            ),
+        )
+
+        answer = response.text
+
+        if not answer:
+            raise ValueError(
+                "Gemini returned an empty response."
+            )
+
+        return answer.strip()
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        traceback.print_exc()
+
+        raise HTTPException(
+            status_code=503,
+            detail=f"Gemini API error: {str(exc)}"
+        )
+
+
 def ollama_answer(
     messages,
     num_predict=260
@@ -245,7 +362,7 @@ def ollama_answer(
         client = get_ollama_client()
 
         response = client.chat(
-            model=MODEL,
+            model=OLLAMA_MODEL,
             messages=messages,
             options={
                 "temperature": 0.1,
@@ -262,14 +379,32 @@ def ollama_answer(
         ].strip()
 
     except Exception as exc:
+        traceback.print_exc()
+
         raise HTTPException(
             status_code=503,
             detail=(
                 f"Ollama error: {str(exc)}. "
-                f"Make sure the configured Ollama server "
-                f"is running and model '{MODEL}' is available."
+                f"Make sure Ollama is running "
+                f"and model '{OLLAMA_MODEL}' is available."
             ),
         )
+
+
+def llm_answer(
+    messages,
+    num_predict=260
+):
+    if LLM_PROVIDER.lower() == "gemini":
+        return gemini_answer(
+            messages,
+            num_predict
+        )
+
+    return ollama_answer(
+        messages,
+        num_predict
+    )
 
 
 class ChatRequest(BaseModel):
@@ -293,6 +428,7 @@ def root():
         "name": "DocuMind AI",
         "status": "online",
         "service": "FastAPI",
+        "provider": LLM_PROVIDER,
     }
 
 
@@ -306,21 +442,38 @@ def healthz():
 
 @app.get("/api/health")
 def health():
-    ollama_status = "offline"
+    provider = LLM_PROVIDER.lower()
 
-    try:
-        client = get_ollama_client()
-        client.list()
-        ollama_status = "online"
-    except Exception:
+    if provider == "gemini":
+        llm_status = (
+            "configured"
+            if GEMINI_API_KEY
+            else "not_configured"
+        )
+
+        model_name = GEMINI_MODEL
+
+    else:
         ollama_status = "offline"
+
+        try:
+            client = get_ollama_client()
+            client.list()
+            ollama_status = "online"
+        except Exception:
+            ollama_status = "offline"
+
+        llm_status = ollama_status
+        model_name = OLLAMA_MODEL
 
     return {
         "name": "DocuMind AI",
         "status": "online",
-        "model": MODEL,
-        "ollama": ollama_status,
+        "provider": provider,
+        "model": model_name,
+        "llm": llm_status,
         "embedding_model": EMBED_MODEL,
+        "vector_store": "FAISS",
     }
 
 
@@ -648,7 +801,7 @@ def chat(
         }
     )
 
-    answer = ollama_answer(
+    answer = llm_answer(
         messages,
         260
     )
@@ -726,7 +879,7 @@ def summary(
         },
     ]
 
-    answer = ollama_answer(
+    answer = llm_answer(
         messages,
         320
     )
@@ -739,9 +892,16 @@ def summary(
 
 @app.get("/api/model")
 def model():
+    if LLM_PROVIDER.lower() == "gemini":
+        provider = "Gemini"
+        model_name = GEMINI_MODEL
+    else:
+        provider = "Ollama"
+        model_name = OLLAMA_MODEL
+
     return {
-        "model": MODEL,
-        "provider": "Ollama",
+        "model": model_name,
+        "provider": provider,
         "embedding_model": EMBED_MODEL,
         "vector_store": "FAISS",
     }
