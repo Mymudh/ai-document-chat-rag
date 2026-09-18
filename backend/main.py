@@ -31,7 +31,12 @@ GEMINI_API_KEY = os.getenv(
 
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
-    "gemini-2.5-flash"
+    "gemini-3.6-flash"
+)
+
+GEMINI_FALLBACK_MODEL = os.getenv(
+    "GEMINI_FALLBACK_MODEL",
+    "gemini-3.5-flash-lite"
 )
 
 GEMINI_EMBEDDING_MODEL = os.getenv(
@@ -251,54 +256,44 @@ def gemini_answer(
     messages,
     num_predict=260
 ):
-    try:
-        from google.genai import types
+    from google.genai import types
 
-        client = get_gemini_client()
+    client = get_gemini_client()
 
-        system_parts = []
-        conversation_parts = []
+    system_parts = []
+    conversation_parts = []
 
-        for message in messages:
-            role = message.get(
-                "role",
-                "user"
+    for message in messages:
+        role = message.get("role", "user")
+        content = message.get("content", "")
+
+        if role == "system":
+            system_parts.append(content)
+
+        elif role == "user":
+            conversation_parts.append(
+                f"USER:\n{content}"
             )
 
-            content = message.get(
-                "content",
-                ""
+        elif role == "assistant":
+            conversation_parts.append(
+                f"ASSISTANT:\n{content}"
             )
 
-            if role == "system":
-                system_parts.append(
-                    content
-                )
+    system_instruction = "\n\n".join(
+        system_parts
+    ).strip()
 
-            elif role == "user":
-                conversation_parts.append(
-                    f"USER:\n{content}"
-                )
+    prompt = "\n\n".join(
+        conversation_parts
+    ).strip()
 
-            elif role == "assistant":
-                conversation_parts.append(
-                    f"ASSISTANT:\n{content}"
-                )
-
-        system_instruction = "\n\n".join(
-            system_parts
-        ).strip()
-
-        prompt = "\n\n".join(
-            conversation_parts
-        ).strip()
-
+    def generate(model_name):
         response = client.models.generate_content(
-            model=GEMINI_MODEL,
+            model=model_name,
             contents=prompt,
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
-                temperature=0.1,
                 max_output_tokens=num_predict
             )
         )
@@ -312,17 +307,87 @@ def gemini_answer(
 
         return answer.strip()
 
-    except HTTPException:
-        raise
+    def is_retryable_error(exc):
+        error_code = getattr(
+            exc,
+            "code",
+            None
+        )
 
-    except Exception as exc:
+        error_text = str(exc).upper()
+
+        return (
+            error_code in {
+                408,
+                429,
+                500,
+                502,
+                503,
+                504
+            }
+            or "503" in error_text
+            or "UNAVAILABLE" in error_text
+            or "RESOURCE_EXHAUSTED" in error_text
+            or "TIMEOUT" in error_text
+            or "INTERNAL" in error_text
+        )
+
+    primary_error = None
+
+    for attempt in range(3):
+        try:
+            print(
+                f"Gemini primary attempt "
+                f"{attempt + 1}/3: {GEMINI_MODEL}",
+                flush=True
+            )
+
+            return generate(GEMINI_MODEL)
+
+        except Exception as exc:
+            primary_error = exc
+
+            if not is_retryable_error(exc):
+                traceback.print_exc()
+
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        f"Gemini API error: {str(exc)}"
+                    )
+                )
+
+            if attempt < 2:
+                delay = 2 ** attempt + 1
+
+                print(
+                    f"Gemini temporarily unavailable. "
+                    f"Retrying in {delay}s...",
+                    flush=True
+                )
+
+                time.sleep(delay)
+
+    fallback_model = GEMINI_FALLBACK_MODEL
+
+    print(
+        f"Primary model failed. "
+        f"Trying fallback model: {fallback_model}",
+        flush=True
+    )
+
+    try:
+        return generate(fallback_model)
+
+    except Exception as fallback_error:
         traceback.print_exc()
 
         raise HTTPException(
             status_code=503,
             detail=(
-                "Gemini API error: "
-                f"{str(exc)}"
+                "Gemini is temporarily unavailable. "
+                f"Primary model error: {primary_error}. "
+                f"Fallback model error: {fallback_error}"
             )
         )
 
@@ -624,6 +689,11 @@ def health():
         "status": "online",
         "provider": provider,
         "model": model_name,
+        "fallback_model": (
+            GEMINI_FALLBACK_MODEL
+            if provider == "gemini"
+            else None
+        ),
         "llm": llm_status,
         "embedding_model": GEMINI_EMBEDDING_MODEL,
         "embedding_dimension": EMBEDDING_DIMENSION,
