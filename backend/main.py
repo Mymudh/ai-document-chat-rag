@@ -5,6 +5,10 @@ import traceback
 import uuid
 from typing import List
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import numpy as np
 import faiss
 
@@ -31,7 +35,7 @@ GEMINI_API_KEY = os.getenv(
 
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
-    "gemini-3.6-flash"
+    "gemini-3.5-flash"
 )
 
 GEMINI_FALLBACK_MODEL = os.getenv(
@@ -254,7 +258,7 @@ def create_query_embedding(
 
 def gemini_answer(
     messages,
-    num_predict=260
+    num_predict=1024
 ):
     from google.genai import types
 
@@ -294,18 +298,62 @@ def gemini_answer(
             contents=prompt,
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
-                max_output_tokens=num_predict
+                max_output_tokens=num_predict,
+                thinking_config=types.ThinkingConfig(
+                    thinking_level="minimal"
+                )
             )
         )
 
         answer = response.text
+
+        finish_reason = None
+        try:
+            if response.candidates:
+                finish_reason = response.candidates[0].finish_reason
+        except Exception:
+            finish_reason = None
+
+        print(
+            f"Gemini response finish reason: {finish_reason}",
+            flush=True
+        )
 
         if not answer:
             raise ValueError(
                 "Gemini returned an empty response."
             )
 
-        return answer.strip()
+        answer = answer.strip()
+
+        if finish_reason is not None and "MAX_TOKENS" in str(finish_reason).upper():
+            print(
+                "Gemini response hit MAX_TOKENS. Retrying with 2048 output tokens.",
+                flush=True
+            )
+
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    max_output_tokens=2048,
+                    thinking_config=types.ThinkingConfig(
+                        thinking_level="minimal"
+                    )
+                )
+            )
+
+            answer = response.text
+
+            if not answer:
+                raise ValueError(
+                    "Gemini returned an empty response after MAX_TOKENS retry."
+                )
+
+            answer = answer.strip()
+
+        return answer
 
     def is_retryable_error(exc):
         error_code = getattr(
@@ -394,7 +442,7 @@ def gemini_answer(
 
 def ollama_answer(
     messages,
-    num_predict=260
+    num_predict=1024
 ):
     try:
         client = get_ollama_client()
@@ -431,7 +479,7 @@ def ollama_answer(
 
 def llm_answer(
     messages,
-    num_predict=260
+    num_predict=1024
 ):
     if LLM_PROVIDER == "gemini":
         return gemini_answer(
@@ -1061,7 +1109,10 @@ def chat(
                 "in the uploaded documents. "
                 "Do not invent facts. "
                 "Keep answers concise and useful. "
-                "Mention page numbers when relevant."
+                "Mention page numbers when relevant. "
+                "For list questions, provide a complete numbered list "
+                "of all relevant items found in the supplied context. "
+                "Never stop after an introductory sentence."
             )
         }
     ]
@@ -1086,7 +1137,7 @@ def chat(
 
     answer = llm_answer(
         messages,
-        260
+        1024
     )
 
     session[
@@ -1170,7 +1221,7 @@ def summary(
 
     answer = llm_answer(
         messages,
-        320
+        1024
     )
 
     return {

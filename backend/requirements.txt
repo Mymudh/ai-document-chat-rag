@@ -8,4 +8,4 @@ faiss-cpu
 numpy
 pydantic
 ollama
-google-genai
+google-genai>=2.0.0
